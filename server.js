@@ -1,93 +1,84 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const path = require('path');
+const puppeteer = require('puppeteer');
+const { getStream } = require('puppeteer-stream');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const port = process.env.PORT || 3000;
 
-app.use(express.static(path.join(__dirname, '/')));
+// Middleware
+app.use(express.json());
+app.use(express.static(__dirname));
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
-const fetch = require('node-fetch');
-const puppeteer = require('puppeteer');
+// Google AI Setup
+const API_KEY = 'AIzaSyBbkfIKUE0XMliq1Sxleofkoii3yOF1-VM';
+const genAI = new GoogleGenerativeAI(API_KEY);
 
 let browser;
 let page;
 
-(async () => {
-  browser = await puppeteer.launch({ headless: true });
-  page = await browser.newPage();
-  await page.goto('https://www.google.com');
-})();
-
-const GOOGLE_API_KEY = 'AIzaSyBbkfIKUE0XMliq1Sxleofkoii3yOF1-VM';
-const { getStream } = require('puppeteer-stream');
-
-const GOOGLE_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
-
-app.get('/stream', async (req, res) => {
-    const stream = await getStream(page, { audio: false, video: true });
-    res.writeHead(200, {
-        'Content-Type': 'video/webm',
+async function startBrowser() {
+    browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
-    stream.pipe(res);
-});
-
-async function getAIResponse(prompt) {
-  try {
-    const response = await fetch(GOOGLE_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{
-            text: prompt,
-          }],
-        }],
-      }),
-    });
-    const data = await response.json();
-    return data.candidates[0].content.parts[0].text;
-  } catch (error) {
-    console.error('Error getting AI response:', error);
-    return 'Sorry, I am having trouble connecting to the AI.';
-  }
+    page = await browser.newPage();
+    await page.goto('https://www.google.com');
 }
 
-async function executePuppeteerCommand(command) {
-  try {
-    const result = await eval(`(async () => { ${command} })()`);
-    return result;
-  } catch (error) {
-    console.error('Error executing Puppeteer command:', error);
-    return `Error: ${error.message}`;
-  }
-}
+startBrowser();
 
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+    const stream = getStream(page, {
+        audio: false,
+        video: true,
+        frameSize: 1000 // kb
+    });
 
-  ws.on('message', async (message) => {
-    console.log(`Received message => ${message}`);
-    const aiResponse = await getAIResponse(`Based on the following user request, what is the single puppeteer command to execute? User request: ${message}`);
-    console.log(`AI response => ${aiResponse}`);
-    const result = await executePuppeteerCommand(aiResponse);
-    ws.send(`Executed: ${aiResponse}\nResult: ${result}`);
-  });
+    stream.on('data', (data) => {
+        ws.send(data);
+    });
 
-  ws.on('close', () => {
-    console.log('Client disconnected');
-  });
+    ws.on('close', () => {
+        stream.destroy();
+    });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server is listening on port ${PORT}`);
+// Routes
+app.get('/', (req, res) => {
+    res.sendFile(__dirname + '/index.html');
+});
+
+app.post('/api/execute', async (req, res) => {
+    const { command } = req.body;
+
+    if (!command) {
+        return res.status(400).json({ error: 'Command is required' });
+    }
+
+    try {
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const prompt = `You are an AI assistant controlling a headless browser. Convert the following user command into a series of executable Puppeteer commands in JavaScript. The 'page' object is already available. Only output the code. User command: "${command}"`;
+
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const codeToExecute = response.text();
+
+        // Execute the code in the existing page context
+        await eval(`(async () => { ${codeToExecute} })()`);
+
+        res.json({ message: 'Command executed' });
+
+    } catch (error) {
+        console.error('Error executing command:', error);
+        res.status(500).json({ error: 'Failed to execute command' });
+    }
+});
+
+server.listen(port, () => {
+    console.log(`Server is running on http://localhost:${port}`);
 });
